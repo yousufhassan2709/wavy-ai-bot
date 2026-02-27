@@ -17,7 +17,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 # CLIENTS
 # =========================
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Longer timeout so Railway can reach Anthropic (avoids APIConnectionError)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = Flask(__name__)
