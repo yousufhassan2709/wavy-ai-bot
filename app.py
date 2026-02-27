@@ -8,6 +8,7 @@ from supabase import create_client
 # =========================
 
 import os
+import time
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://znrvyoriduvtfbjdlhmm.supabase.co")
@@ -67,26 +68,44 @@ def webhook():
         print("[DEBUG] No business row found for this phone – using generic prompt.")
 
     # -------------------------
-    # AI RESPONSE
+    # AI RESPONSE (with retry for connection errors)
     # -------------------------
-    try:
-        ai_response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            system=custom_instructions,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_message
-                }
-            ]
-        )
-        reply_text = ai_response.content[0].text
-    except Exception as e:
-        import traceback
-        print("[ERROR]", type(e).__name__, str(e))
-        print(traceback.format_exc())
-        reply_text = f"Sorry, something went wrong: {str(e)}. Please try again later."
+    reply_text = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            ai_response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=500,
+                system=custom_instructions,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_message
+                    }
+                ]
+            )
+            reply_text = ai_response.content[0].text
+            break
+        except anthropic.APIConnectionError as e:
+            last_error = e
+            if attempt < 2:
+                print(f"[RETRY] Attempt {attempt + 1} failed: {e}. Retrying in 2s...")
+                time.sleep(2)
+            else:
+                import traceback
+                print("[ERROR]", type(e).__name__, str(e))
+                print(traceback.format_exc())
+                reply_text = "Sorry, I couldn't reach the AI right now. Please try again in a moment."
+        except Exception as e:
+            import traceback
+            print("[ERROR]", type(e).__name__, str(e))
+            print(traceback.format_exc())
+            reply_text = f"Sorry, something went wrong: {str(e)}. Please try again later."
+            break
+
+    if reply_text is None and last_error:
+        reply_text = "Sorry, I couldn't reach the AI right now. Please try again in a moment."
 
     resp.message(reply_text)
 
