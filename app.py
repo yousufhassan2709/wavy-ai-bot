@@ -82,6 +82,9 @@ def webhook():
         )
         reply_text = ai_response.content[0].text
     except Exception as e:
+        import traceback
+        print("[ERROR]", type(e).__name__, str(e))
+        print(traceback.format_exc())
         reply_text = f"Sorry, something went wrong: {str(e)}. Please try again later."
 
     resp.message(reply_text)
