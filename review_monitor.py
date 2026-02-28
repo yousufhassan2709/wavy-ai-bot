@@ -27,7 +27,11 @@ def resolve_to_chij_place_id(place_id: str, business_name: str) -> str:
         url = "https://places.googleapis.com/v1/places:searchText"
         r = requests.post(
             url,
-            headers={"X-Goog-Api-Key": key, "Content-Type": "application/json"},
+            headers={
+                "X-Goog-Api-Key": key,
+                "Content-Type": "application/json",
+                "X-Goog-FieldMask": "places.id,places.displayName",
+            },
             json={"textQuery": business_name},
             timeout=10,
         )
