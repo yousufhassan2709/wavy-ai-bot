@@ -32,17 +32,24 @@ def resolve_to_chij_place_id(place_id: str, business_name: str) -> str:
             timeout=10,
         )
         if r.status_code != 200:
+            try:
+                err = r.json().get("error", {}).get("message", r.text[:150])
+            except Exception:
+                err = r.text[:150] if r.text else ""
+            print(f"[review_monitor] ChIJ resolve failed (searchText): HTTP {r.status_code} – {err}")
             return place_id
         data = r.json()
         places = data.get("places") or []
         if not places:
+            print("[review_monitor] ChIJ resolve: searchText returned no places")
             return place_id
         # id is like "places/ChIJ..."
         raw_id = (places[0].get("id") or "").strip()
         if raw_id.startswith("places/"):
             return raw_id.replace("places/", "", 1)
         return raw_id or place_id
-    except Exception:
+    except Exception as e:
+        print(f"[review_monitor] ChIJ resolve error: {e}")
         return place_id
 
 
@@ -53,8 +60,16 @@ def _fetch_reviews_new_api(place_id: str, key: str):
     r = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=10)
     if r.status_code == 200:
         data = r.json()
+        if "error" in data:
+            msg = data["error"].get("message", data["error"].get("status", ""))
+            return None, f"New API error: {msg}"
         return data.get("reviews") or [], None
-    return None, f"HTTP {r.status_code}"
+    try:
+        err_body = r.json()
+        msg = err_body.get("error", {}).get("message", r.text[:200])
+    except Exception:
+        msg = r.text[:200] if r.text else ""
+    return None, f"HTTP {r.status_code}" + (f" – {msg}" if msg else "")
 
 
 def get_place_reviews(place_id: str):
@@ -79,12 +94,14 @@ def get_place_reviews(place_id: str):
                 if err is None:
                     print("[review_monitor] Used Places API (New) for hex place_id")
                     return reviews, None
+                print(f"[review_monitor] New API fallback failed: {err}")
             return [], status
         if is_hex:
             reviews, err = _fetch_reviews_new_api(place_id, key)
             if err is None:
                 print("[review_monitor] Used Places API (New) for hex place_id")
                 return reviews, None
+            print(f"[review_monitor] New API fallback failed: {err}")
         return None, f"HTTP {r2.status_code}"
     except Exception as e:
         return None, str(e)
