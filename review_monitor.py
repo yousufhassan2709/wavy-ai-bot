@@ -16,26 +16,28 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # e.g. whatsapp:+14155238886
 
 def get_place_reviews(place_id: str):
-    """Fetch reviews for a place. Tries New API then legacy."""
+    """Fetch reviews for a place. Tries legacy API first (works with ChIJ and hex), then new API."""
     key = GOOGLE_PLACES_API_KEY
     if not key:
         return None, "No GOOGLE_PLACES_API_KEY"
-    # New Places API (v1) - place_id in path (hex format URL-encoded)
-    place_id_encoded = place_id.replace(":", "%3A")
-    url = f"https://places.googleapis.com/v1/places/{place_id_encoded}?fields=reviews,displayName"
+    # Legacy Place Details – works with ChIJ... and often with hex place_id
+    url_legacy = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&fields=reviews,name&key={key}"
     try:
-        r = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("reviews") or [], None
-        # Fallback: legacy Place Details (uses ChIJ place_id; our hex may not work)
-        url_legacy = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&fields=reviews,name&key={key}"
         r2 = requests.get(url_legacy, timeout=10)
         if r2.status_code == 200:
             j = r2.json()
             if j.get("status") == "OK" and "result" in j:
-                return j["result"].get("reviews") or [], None
+                reviews = j["result"].get("reviews") or []
+                # Legacy API shape: list of { author_name, rating, text, ... }
+                return reviews, None
             return [], j.get("status", "unknown")
+        # Fallback: New Places API (v1) – place_id in path
+        place_id_encoded = place_id.replace(":", "%3A")
+        url = f"https://places.googleapis.com/v1/places/{place_id_encoded}?fields=reviews,displayName"
+        r = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("reviews") or [], None
         return None, f"HTTP {r.status_code}"
     except Exception as e:
         return None, str(e)
@@ -44,7 +46,9 @@ def run_review_check():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     businesses = supabase.table("businesses").select("id, name, owner_phone, place_id").not_.is_("place_id", "null").execute()
     if not businesses.data:
+        print("[review_monitor] No businesses with place_id found – add place_id in Supabase")
         return
+    print(f"[review_monitor] Checking {len(businesses.data)} business(es)")
     twilio = None
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM:
         twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -54,12 +58,16 @@ def run_review_check():
             continue
         reviews, err = get_place_reviews(place_id)
         if err:
-            print(f"[review_monitor] {biz.get('name')} place_id={place_id[:20]}... err={err}")
+            print(f"[review_monitor] {biz.get('name')} place_id={place_id[:30]}... err={err}")
             continue
         if not reviews:
+            print(f"[review_monitor] {biz.get('name')} – 0 reviews from Google (or Place ID not valid)")
             continue
+        print(f"[review_monitor] {biz.get('name')} – got {len(reviews)} review(s)")
         for rev in reviews:
-            author = (rev.get("authorAttribution") or {}).get("displayName") or "Someone"
+            # Legacy API: author_name, rating, text
+            # New API: authorAttribution.displayName, rating, text (or text.text)
+            author = (rev.get("authorAttribution") or {}).get("displayName") or rev.get("author_name") or "Someone"
             rating = rev.get("rating") or 0
             raw_text = rev.get("text")
             if isinstance(raw_text, dict):
@@ -87,5 +95,11 @@ def run_review_check():
                 body = f"{urgent}New review for {biz.get('name', 'your business')}\n\n{author} – {rating} stars\n{text[:300]}"
                 try:
                     twilio.messages.create(body=body, from_=TWILIO_WHATSAPP_FROM, to=to_phone)
+                    print(f"[review_monitor] WhatsApp sent to owner for new review")
                 except Exception as e:
                     print(f"[review_monitor] Twilio send failed: {e}")
+            else:
+                if not twilio:
+                    print("[review_monitor] Twilio not configured – set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM")
+                elif not to_phone:
+                    print(f"[review_monitor] No owner_phone for {biz.get('name')}")

@@ -113,6 +113,23 @@ def webhook():
 
 
 # =========================
+# MANUAL REVIEW CHECK (for debugging)
+# =========================
+
+@app.route("/check-reviews", methods=["GET"])
+def check_reviews():
+    """Run review check once. Check Railway logs for [review_monitor] messages."""
+    try:
+        from review_monitor import run_review_check
+        run_review_check()
+        return "Review check ran. See Railway logs for [review_monitor] output.", 200
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return f"Error: {e}", 500
+
+
+# =========================
 # REVIEW MONITOR (every 30 min)
 # =========================
 
