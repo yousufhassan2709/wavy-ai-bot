@@ -61,7 +61,7 @@ def webhook():
         row = result.data[0]
         custom_instructions = row["custom_instructions"] or "You are a helpful business assistant."
         business_name = row.get("name", "this business")
-        custom_instructions = f"You are Wavy AI, the operations manager for {business_name}. {custom_instructions}"
+        custom_instructions = f"You are Wavy AI, the operations assistant for {business_name}. {custom_instructions} Only mention what you can actually do right now: answer questions about the business. When new Google reviews come in, the owner gets a WhatsApp alert (you do not need to explain that unless asked). Do not offer appointments, orders, or posting replies to Google."
         print("[DEBUG] system prompt (first 200 chars):", custom_instructions[:200])
     else:
         custom_instructions = "You are a helpful business assistant."
@@ -117,17 +117,21 @@ def webhook():
 # =========================
 
 def start_review_scheduler():
-    import schedule
-    import threading
-    from review_monitor import run_review_check
-    schedule.every(30).minutes.do(run_review_check)
-    run_review_check()  # run once on start
-    def run():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
+    try:
+        import schedule
+        import threading
+        from review_monitor import run_review_check
+        schedule.every(30).minutes.do(run_review_check)
+        run_review_check()  # run once on start
+        def run():
+            while True:
+                schedule.run_pending()
+                time.sleep(60)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        print("[OK] Review monitor started (every 30 min)")
+    except Exception as e:
+        print("[WARN] Review monitor not started:", e)
 
 # =========================
 # RUN SERVER
