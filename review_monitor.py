@@ -46,30 +46,46 @@ def resolve_to_chij_place_id(place_id: str, business_name: str) -> str:
         return place_id
 
 
+def _fetch_reviews_new_api(place_id: str, key: str):
+    """Fetch reviews using Places API (New) – accepts hex place_id in path."""
+    place_id_encoded = place_id.replace(":", "%3A")
+    url = f"https://places.googleapis.com/v1/places/{place_id_encoded}?fields=reviews,displayName"
+    r = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=10)
+    if r.status_code == 200:
+        data = r.json()
+        return data.get("reviews") or [], None
+    return None, f"HTTP {r.status_code}"
+
+
 def get_place_reviews(place_id: str):
-    """Fetch reviews for a place. Tries legacy API first (works with ChIJ and hex), then new API."""
+    """Fetch reviews. Tries legacy (ChIJ) first; if INVALID_REQUEST and place_id is hex, tries New API."""
     key = GOOGLE_PLACES_API_KEY
     if not key:
         return None, "No GOOGLE_PLACES_API_KEY"
-    # Legacy Place Details – works with ChIJ... and often with hex place_id
-    url_legacy = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&fields=reviews,name&key={key}"
+    is_hex = "0x" in place_id and ":" in place_id
     try:
+        # Legacy Place Details – works with ChIJ, often fails with hex
+        url_legacy = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&fields=reviews,name&key={key}"
         r2 = requests.get(url_legacy, timeout=10)
         if r2.status_code == 200:
             j = r2.json()
             if j.get("status") == "OK" and "result" in j:
                 reviews = j["result"].get("reviews") or []
-                # Legacy API shape: list of { author_name, rating, text, ... }
                 return reviews, None
-            return [], j.get("status", "unknown")
-        # Fallback: New Places API (v1) – place_id in path
-        place_id_encoded = place_id.replace(":", "%3A")
-        url = f"https://places.googleapis.com/v1/places/{place_id_encoded}?fields=reviews,displayName"
-        r = requests.get(url, headers={"X-Goog-Api-Key": key}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("reviews") or [], None
-        return None, f"HTTP {r.status_code}"
+            status = j.get("status", "unknown")
+            # If legacy rejects hex, try New API (accepts hex in path)
+            if is_hex and status in ("INVALID_REQUEST", "ZERO_RESULTS"):
+                reviews, err = _fetch_reviews_new_api(place_id, key)
+                if err is None:
+                    print("[review_monitor] Used Places API (New) for hex place_id")
+                    return reviews, None
+            return [], status
+        if is_hex:
+            reviews, err = _fetch_reviews_new_api(place_id, key)
+            if err is None:
+                print("[review_monitor] Used Places API (New) for hex place_id")
+                return reviews, None
+        return None, f"HTTP {r2.status_code}"
     except Exception as e:
         return None, str(e)
 
@@ -87,10 +103,12 @@ def run_review_check():
         place_id = biz.get("place_id")
         if not place_id:
             continue
-        # Hex place_id (from Maps URL) → resolve to ChIJ for legacy API
+        # Hex place_id (from Maps URL) → try to resolve to ChIJ; else we'll try New API in get_place_reviews
         resolved_id = resolve_to_chij_place_id(place_id, biz.get("name") or "")
         if resolved_id != place_id:
             print(f"[review_monitor] Resolved place_id to ChIJ format for {biz.get('name')}")
+        elif "0x" in place_id and ":" in place_id:
+            print(f"[review_monitor] Using hex place_id – will try New Places API if legacy fails")
         reviews, err = get_place_reviews(resolved_id)
         if err:
             print(f"[review_monitor] {biz.get('name')} place_id={place_id[:30]}... err={err}")
