@@ -15,6 +15,37 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # e.g. whatsapp:+14155238886
 
+
+def resolve_to_chij_place_id(place_id: str, business_name: str) -> str:
+    """If place_id is hex (0x...:0x...), resolve to ChIJ via Places searchText. Else return as-is."""
+    if place_id.startswith("ChIJ"):
+        return place_id
+    key = GOOGLE_PLACES_API_KEY
+    if not key or not business_name:
+        return place_id
+    try:
+        url = "https://places.googleapis.com/v1/places:searchText"
+        r = requests.post(
+            url,
+            headers={"X-Goog-Api-Key": key, "Content-Type": "application/json"},
+            json={"textQuery": business_name},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return place_id
+        data = r.json()
+        places = data.get("places") or []
+        if not places:
+            return place_id
+        # id is like "places/ChIJ..."
+        raw_id = (places[0].get("id") or "").strip()
+        if raw_id.startswith("places/"):
+            return raw_id.replace("places/", "", 1)
+        return raw_id or place_id
+    except Exception:
+        return place_id
+
+
 def get_place_reviews(place_id: str):
     """Fetch reviews for a place. Tries legacy API first (works with ChIJ and hex), then new API."""
     key = GOOGLE_PLACES_API_KEY
@@ -56,7 +87,11 @@ def run_review_check():
         place_id = biz.get("place_id")
         if not place_id:
             continue
-        reviews, err = get_place_reviews(place_id)
+        # Hex place_id (from Maps URL) → resolve to ChIJ for legacy API
+        resolved_id = resolve_to_chij_place_id(place_id, biz.get("name") or "")
+        if resolved_id != place_id:
+            print(f"[review_monitor] Resolved place_id to ChIJ format for {biz.get('name')}")
+        reviews, err = get_place_reviews(resolved_id)
         if err:
             print(f"[review_monitor] {biz.get('name')} place_id={place_id[:30]}... err={err}")
             continue
@@ -74,7 +109,7 @@ def run_review_check():
                 text = raw_text.get("text") or ""
             else:
                 text = str(raw_text or "")
-            review_id = f"{place_id}|{author}|{text[:50]}"
+            review_id = f"{resolved_id}|{author}|{text[:50]}"
             existing = supabase.table("seen_reviews").select("id").eq("review_id", review_id).limit(1).execute()
             if existing.data:
                 continue
