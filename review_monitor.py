@@ -137,7 +137,13 @@ def run_review_check():
         if not reviews:
             print(f"[review_monitor] {biz.get('name')} – 0 reviews from Google (or Place ID not valid)")
             continue
-        print(f"[review_monitor] {biz.get('name')} – got {len(reviews)} review(s)")
+        # Only send WhatsApp for reviews that appear *after* we've already backfilled (so we don't alert for old reviews on first run)
+        existing = supabase.table("seen_reviews").select("id").eq("business_id", biz["id"]).limit(1).execute()
+        is_backfill = not (existing.data and len(existing.data) > 0)
+        if is_backfill:
+            print(f"[review_monitor] {biz.get('name')} – backfilling {len(reviews)} existing review(s), no WhatsApp")
+        else:
+            print(f"[review_monitor] {biz.get('name')} – got {len(reviews)} review(s)")
         for rev in reviews:
             # Legacy API: author_name, rating, text
             # New API: authorAttribution.displayName, rating, text (or text.text)
@@ -160,7 +166,9 @@ def run_review_check():
                 "review_text": text,
                 "replied": False,
             }).execute()
-            # Alert owner via WhatsApp
+            # Alert owner via WhatsApp only for truly new reviews (not during first-time backfill)
+            if is_backfill:
+                continue
             to_phone = biz.get("owner_phone") or ""
             if to_phone and not to_phone.startswith("whatsapp:"):
                 to_phone = f"whatsapp:{to_phone}"
