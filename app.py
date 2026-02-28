@@ -113,8 +113,28 @@ def webhook():
 
 
 # =========================
+# REVIEW MONITOR (every 30 min)
+# =========================
+
+def start_review_scheduler():
+    import schedule
+    import threading
+    from review_monitor import run_review_check
+    schedule.every(30).minutes.do(run_review_check)
+    run_review_check()  # run once on start
+    def run():
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+# =========================
 # RUN SERVER
 # =========================
+
+# Start review monitor (runs in background; works when run as script or by gunicorn)
+start_review_scheduler()
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
