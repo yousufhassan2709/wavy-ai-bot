@@ -4,6 +4,8 @@ No posting to Google until approval (stub).
 """
 import os
 import time
+from datetime import datetime, timezone
+
 import requests
 from supabase import create_client
 from twilio.rest import Client as TwilioClient
@@ -14,6 +16,34 @@ GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")  # e.g. whatsapp:+14155238886
+
+# Only send WhatsApp for reviews from the last N days (avoids alerting for old reviews that appear in API)
+RECENT_REVIEW_DAYS = 14
+
+
+def _review_publish_timestamp(rev: dict) -> int | None:
+    """Return review publish time as Unix seconds, or None if unknown. Legacy API: time; New API: publishTime (RFC3339)."""
+    # Legacy Place Details
+    t = rev.get("time")
+    if t is not None:
+        return int(t)
+    # New API: publishTime is RFC3339 string
+    pt = rev.get("publishTime")
+    if isinstance(pt, str):
+        try:
+            dt = datetime.fromisoformat(pt.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    return None
+
+
+def _is_recent_review(rev: dict) -> bool:
+    """True if the review was published within RECENT_REVIEW_DAYS."""
+    ts = _review_publish_timestamp(rev)
+    if ts is None:
+        return False  # unknown date → don't alert (avoids old reviews without timestamp)
+    return (time.time() - ts) <= RECENT_REVIEW_DAYS * 24 * 3600
 
 
 def resolve_to_chij_place_id(place_id: str, business_name: str) -> str:
@@ -168,6 +198,10 @@ def run_review_check():
             }).execute()
             # Alert owner via WhatsApp only for truly new reviews (not during first-time backfill)
             if is_backfill:
+                continue
+            # Only alert for reviews from the last RECENT_REVIEW_DAYS (ignore old ones that just showed up in API)
+            if not _is_recent_review(rev):
+                print(f"[review_monitor] Skipping WhatsApp for old review (older than {RECENT_REVIEW_DAYS} days)")
                 continue
             to_phone = biz.get("owner_phone") or ""
             if to_phone and not to_phone.startswith("whatsapp:"):
