@@ -144,6 +144,7 @@ def run_review_check():
             print(f"[review_monitor] {biz.get('name')} – backfilling {len(reviews)} existing review(s), no WhatsApp")
         else:
             print(f"[review_monitor] {biz.get('name')} – got {len(reviews)} review(s)")
+        new_count = 0
         for rev in reviews:
             # Legacy API: author_name, rating, text
             # New API: authorAttribution.displayName, rating, text (or text.text)
@@ -158,6 +159,7 @@ def run_review_check():
             existing = supabase.table("seen_reviews").select("id").eq("review_id", review_id).limit(1).execute()
             if existing.data:
                 continue
+            new_count += 1
             supabase.table("seen_reviews").insert({
                 "review_id": review_id,
                 "business_id": biz["id"],
@@ -185,3 +187,5 @@ def run_review_check():
                     print("[review_monitor] Twilio not configured – set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM")
                 elif not to_phone:
                     print(f"[review_monitor] No owner_phone for {biz.get('name')}")
+        if not is_backfill and new_count == 0 and reviews:
+            print(f"[review_monitor] {biz.get('name')} – 0 new reviews (all {len(reviews)} already in DB). New reviews can take a few mins to appear in Google's API.")
