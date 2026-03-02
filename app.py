@@ -39,11 +39,23 @@ app = Flask(__name__)
 # =========================
 # HELPERS
 # =========================
+def _normalize_whatsapp_number(num):
+    """Ensure number has whatsapp: and + for E.164 (e.g. 34665495281 -> whatsapp:+34665495281)."""
+    s = (num or "").strip().replace("whatsapp:", "").strip()
+    if not s:
+        return ""
+    if not s.startswith("+"):
+        s = "+" + s
+    return f"whatsapp:{s}"
+
+
 def send_whatsapp(to, message):
     if not twilio_client or not TWILIO_WHATSAPP_NUMBER:
         print("[WARN] Twilio not configured, skipping WhatsApp send")
         return
-    to = to if str(to).startswith("whatsapp:") else f"whatsapp:{to}"
+    to = _normalize_whatsapp_number(to) if to else ""
+    if not to:
+        return
     twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, to=to, body=message)
 
 
@@ -328,12 +340,17 @@ def handle_send_order(business):
         return "No pending purchase orders found."
     action = pending.data[0]
     item = json.loads(action.get("item_data") or "{}")
-    supplier_wa = item.get("supplier_whatsapp", "")
+    supplier_wa = (item.get("supplier_whatsapp") or "").strip()
     if not supplier_wa:
         return f"No WhatsApp number for {item.get('supplier_name')}. Add it to your Google Sheet."
-    if not str(supplier_wa).startswith("whatsapp:"):
-        supplier_wa = f"whatsapp:{supplier_wa}"
-    send_whatsapp(supplier_wa, action.get("draft_reply", ""))
+    to_number = _normalize_whatsapp_number(supplier_wa)
+    if not to_number:
+        return "Invalid supplier WhatsApp number. Use digits with country code (e.g. +34665495281)."
+    try:
+        send_whatsapp(to_number, action.get("draft_reply", ""))
+    except Exception as e:
+        print(f"[send order] Twilio failed: {e}")
+        return f"❌ Could not send to supplier: {str(e)}. Check the number is correct and includes country code (e.g. +34...). Order is still pending — try again or fix the number in your sheet."
     supabase.table("pending_actions").update({"status": "completed"}).eq("id", action["id"]).execute()
     return f"✅ Order sent to {item.get('supplier_name')}!"
 
