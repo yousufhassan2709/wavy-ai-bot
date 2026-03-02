@@ -10,6 +10,7 @@ import os
 import json
 from datetime import datetime, timedelta
 import schedule
+import csv
 
 # =========================
 # KEYS – all from env (set in Railway / .env). Never commit secrets.
@@ -85,33 +86,41 @@ def _sheet_id_from_url(url):
         return None
 
 
+def _csv_export_url(sheet_url: str) -> str | None:
+    """Convert a Google Sheets URL to its CSV export URL."""
+    if not sheet_url:
+        return None
+    base = sheet_url.split("/edit", 1)[0].split("?", 1)[0].rstrip("/")
+    if "/d/" not in base:
+        return None
+    return f"{base}/export?format=csv"
+
+
 def read_stock_sheet(business):
+    """
+    Read the stock Google Sheet as CSV.
+
+    Requires the sheet to be shared as:
+    - General access: 'Anyone with the link' (Viewer)
+    """
     sheet_url = business.get("sheets_url") or DEFAULT_SHEET_URL
-    sid = _sheet_id_from_url(sheet_url)
-    if not sid:
-        return []
-    creds = get_google_creds()
-    if not creds:
+    export_url = _csv_export_url(sheet_url)
+    if not export_url:
         return []
     try:
-        try:
-            from google.auth.transport.requests import Request
-        except ImportError:
-            return []
-        creds.refresh(Request())
-        headers = {"Authorization": f"Bearer {creds.token}"}
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/Sheet1!A:Z"
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(export_url, timeout=15)
         if r.status_code != 200:
-            print(f"Sheets API error: {r.status_code} {r.text[:200]}")
+            print(f"Sheets CSV error: {r.status_code} {r.text[:200]}")
             return []
-        data = r.json()
-        values = data.get("values") or []
-        if len(values) < 2:
+        lines = r.text.splitlines()
+        if len(lines) < 2:
             return []
-        headers_row = [str(h).strip() for h in values[0]]
+        reader = csv.reader(lines)
+        headers_row = [h.strip() for h in next(reader, [])]
+        if not headers_row:
+            return []
         records = []
-        for row in values[1:]:
+        for row in reader:
             row = list(row) + [""] * (len(headers_row) - len(row))
             records.append(dict(zip(headers_row, row[: len(headers_row)])))
         return records
