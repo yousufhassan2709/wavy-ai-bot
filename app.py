@@ -56,7 +56,7 @@ def get_business(sender):
 
 
 def get_google_creds():
-    """Load Google service account from env JSON. Returns None if not set."""
+    """Load Google service account from env JSON. Returns None if not set or google-auth not installed."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
@@ -64,6 +64,8 @@ def get_google_creds():
         info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         return Credentials.from_service_account_info(info, scopes=scopes)
+    except ImportError:
+        return None  # google-auth not installed – Stock Guard disabled
     except Exception as e:
         print(f"[WARN] Google service account load failed: {e}")
         return None
@@ -92,7 +94,10 @@ def read_stock_sheet(business):
     if not creds:
         return []
     try:
-        from google.auth.transport.requests import Request
+        try:
+            from google.auth.transport.requests import Request
+        except ImportError:
+            return []
         creds.refresh(Request())
         headers = {"Authorization": f"Bearer {creds.token}"}
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/Sheet1!A:Z"
