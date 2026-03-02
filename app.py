@@ -126,9 +126,9 @@ def sync_stock_to_supabase(business, rows):
         if not name:
             continue
         try:
-            qty = float(row.get("Current Quantity", 0))
-            threshold = float(row.get("Reorder Threshold", 0))
-            reorder = float(row.get("Reorder Quantity", 0))
+            qty = float(row.get("Current Quantity") or 0)
+            threshold = float(row.get("Reorder Threshold") or 0)
+            reorder = float(row.get("Reorder Quantity") or 0)
         except (TypeError, ValueError):
             continue
         unit = row.get("Unit", "")
@@ -197,9 +197,9 @@ def check_stock_levels(business, rows):
         if not name:
             continue
         try:
-            qty = float(row.get("Current Quantity", 0))
-            threshold = float(row.get("Reorder Threshold", 0))
-            reorder = float(row.get("Reorder Quantity", 0))
+            qty = float(row.get("Current Quantity") or 0)
+            threshold = float(row.get("Reorder Threshold") or 0)
+            reorder = float(row.get("Reorder Quantity") or 0)
         except (TypeError, ValueError):
             continue
         if qty <= threshold:
