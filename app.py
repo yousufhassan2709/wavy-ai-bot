@@ -8,9 +8,11 @@ import threading
 import time
 import os
 import json
+import re
 from datetime import datetime, timedelta
 import schedule
 import csv
+from urllib.parse import quote
 
 # =========================
 # KEYS – all from env (set in Railway / .env). Never commit secrets.
@@ -141,6 +143,87 @@ def read_stock_sheet(business):
         return []
 
 
+def _col_num_to_letters(col_num):
+    """1-based column number -> Excel/Sheets letters."""
+    letters = ""
+    while col_num > 0:
+        col_num, rem = divmod(col_num - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _get_google_access_token():
+    creds = get_google_creds()
+    if not creds:
+        return None
+    try:
+        from google.auth.transport.requests import Request
+        creds.refresh(Request())
+        return creds.token
+    except Exception as e:
+        print(f"[WARN] Google token refresh failed: {e}")
+        return None
+
+
+def _update_sheet_quantity(business, item_name, new_qty):
+    """
+    Best-effort quantity update in Google Sheets.
+    Requires GOOGLE_SERVICE_ACCOUNT_JSON with editor access to the sheet.
+    """
+    sheet_url = business.get("sheets_url") or DEFAULT_SHEET_URL
+    sheet_id = _sheet_id_from_url(sheet_url)
+    token = _get_google_access_token()
+    if not sheet_id or not token:
+        return False, "Sheet write skipped (no sheet id or Google write credentials)."
+
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        meta_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}?fields=sheets.properties.title"
+        meta = requests.get(meta_url, headers=headers, timeout=10).json()
+        sheets = (meta.get("sheets") or [])
+        if not sheets:
+            return False, "Could not find a sheet tab."
+        sheet_title = sheets[0].get("properties", {}).get("title", "Sheet1")
+
+        read_range = f"{sheet_title}!A1:Z1000"
+        read_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(read_range)}"
+        values_resp = requests.get(read_url, headers=headers, timeout=10).json()
+        values = values_resp.get("values") or []
+        if not values:
+            return False, "Sheet is empty."
+
+        headers_row = [h.strip() for h in values[0]]
+        try:
+            item_col_idx = headers_row.index("Item Name")
+            qty_col_idx = headers_row.index("Current Quantity")
+        except ValueError:
+            return False, "Sheet headers must include 'Item Name' and 'Current Quantity'."
+
+        target_row = None
+        for idx, row in enumerate(values[1:], start=2):
+            row_item = (row[item_col_idx] if item_col_idx < len(row) else "").strip().lower()
+            if row_item == item_name.strip().lower():
+                target_row = idx
+                break
+
+        if not target_row:
+            return False, f"Item '{item_name}' not found in sheet."
+
+        qty_col_letter = _col_num_to_letters(qty_col_idx + 1)
+        write_range = f"{sheet_title}!{qty_col_letter}{target_row}"
+        write_url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/"
+            f"{quote(write_range)}?valueInputOption=USER_ENTERED"
+        )
+        payload = {"range": write_range, "majorDimension": "ROWS", "values": [[new_qty]]}
+        r = requests.put(write_url, headers={**headers, "Content-Type": "application/json"}, json=payload, timeout=10)
+        if r.status_code >= 300:
+            return False, f"Sheet write failed: {r.status_code} {r.text[:200]}"
+        return True, "Sheet quantity updated."
+    except Exception as e:
+        return False, f"Sheet write failed: {e}"
+
+
 def sync_stock_to_supabase(business, rows):
     for row in rows:
         name = (row.get("Item Name") or "").strip()
@@ -165,6 +248,8 @@ def sync_stock_to_supabase(business, rows):
                 "reorder_threshold": threshold,
                 "reorder_quantity": reorder,
                 "unit": unit,
+                "supplier_name": supplier_name,
+                "supplier_whatsapp": supplier_wa,
                 "last_updated": datetime.now().isoformat(),
             }).eq("id", existing.data[0]["id"]).execute()
             if qty != old_qty:
@@ -223,7 +308,7 @@ def check_stock_levels(business, rows):
             reorder = float(row.get("Reorder Quantity") or 0)
         except (TypeError, ValueError):
             continue
-        if qty <= threshold:
+        if qty <= threshold and not is_item_on_order(business["id"], name):
             days_left = predict_stockout(business["id"], name, qty)
             alerts.append({
                 "name": name,
@@ -236,6 +321,24 @@ def check_stock_levels(business, rows):
                 "days_left": days_left,
             })
     return alerts
+
+
+def is_item_on_order(business_id, item_name):
+    """Cooldown switch: suppress alerts while a sent/confirmed PO exists."""
+    try:
+        po = (
+            supabase.table("pending_actions")
+            .select("id")
+            .eq("business_id", business_id)
+            .eq("action_type", "purchase_order")
+            .eq("item_name", item_name)
+            .in_("status", ["sent", "confirmed"])
+            .limit(1)
+            .execute()
+        )
+        return bool(po.data)
+    except Exception:
+        return False
 
 
 def send_stock_alerts(business, alerts):
@@ -340,28 +443,133 @@ def handle_send_order(business):
         return "No pending purchase orders found."
     action = pending.data[0]
     item = json.loads(action.get("item_data") or "{}")
-    supplier_wa = (item.get("supplier_whatsapp") or "").strip()
+    # Use current supplier number from stock_items (from last sync), not cached item_data
+    current = (
+        supabase.table("stock_items")
+        .select("supplier_whatsapp, supplier_name")
+        .eq("business_id", business["id"])
+        .eq("name", item.get("name", ""))
+        .limit(1)
+        .execute()
+    )
+    if current.data:
+        supplier_wa = (current.data[0].get("supplier_whatsapp") or "").strip()
+        supplier_name = current.data[0].get("supplier_name") or item.get("supplier_name", "Unknown")
+    else:
+        supplier_wa = (item.get("supplier_whatsapp") or "").strip()
+        supplier_name = item.get("supplier_name", "Unknown")
     if not supplier_wa:
-        return f"No WhatsApp number for {item.get('supplier_name')}. Add it to your Google Sheet."
+        return f"No WhatsApp number for {supplier_name}. Add it to your Google Sheet."
     to_number = _normalize_whatsapp_number(supplier_wa)
     if not to_number:
         return "Invalid supplier WhatsApp number. Use digits with country code (e.g. +34665495281)."
+    draft = action.get("draft_reply", "")
     try:
-        send_whatsapp(to_number, action.get("draft_reply", ""))
+        print(f"[send order] Sending to {to_number} for {supplier_name}", flush=True)
+        send_whatsapp(to_number, draft)
+        time.sleep(1)  # give Twilio a moment so both order + reply to same number don't collide
     except Exception as e:
-        print(f"[send order] Twilio failed: {e}")
+        print(f"[send order] Twilio failed: {e}", flush=True)
         return f"❌ Could not send to supplier: {str(e)}. Check the number is correct and includes country code (e.g. +34...). Order is still pending — try again or fix the number in your sheet."
-    supabase.table("pending_actions").update({"status": "completed"}).eq("id", action["id"]).execute()
-    return f"✅ Order sent to {item.get('supplier_name')}!"
+    supabase.table("pending_actions").update({"status": "sent"}).eq("id", action["id"]).execute()
+    # When supplier = your number, the order and this reply both go to you; include the order in the reply so you see it
+    return f"✅ Order sent to {supplier_name}! (Sent to {to_number})\n\n_Message sent:_\n{draft}"
+
+
+def _parse_received_message(incoming_msg):
+    """
+    Supports:
+    - received chicken 10kg
+    - received 10kg chicken
+    - received chicken 10 kg
+    - received 10 kg chicken
+    """
+    text = re.sub(r"\s+", " ", (incoming_msg or "").strip()).lower()
+    m1 = re.match(r"^received\s+(.+?)\s+(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", text)
+    if m1:
+        return m1.group(1).strip(), float(m1.group(2)), m1.group(3).strip()
+    m2 = re.match(r"^received\s+(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s+(.+)$", text)
+    if m2:
+        return m2.group(3).strip(), float(m2.group(1)), m2.group(2).strip()
+    return None, None, None
+
+
+def handle_received_stock(business, incoming_msg):
+    item_text, qty, unit_text = _parse_received_message(incoming_msg)
+    if not item_text or not qty or qty <= 0:
+        return "Use format: *received chicken 10kg* or *received 10kg chicken*."
+
+    items = (
+        supabase.table("stock_items")
+        .select("*")
+        .eq("business_id", business["id"])
+        .ilike("name", f"%{item_text}%")
+        .limit(1)
+        .execute()
+    )
+    if not items.data:
+        return f"I couldn't find '{item_text}' in your stock list."
+
+    item = items.data[0]
+    old_qty = float(item.get("current_quantity") or 0)
+    new_qty = old_qty + qty
+    item_name = item["name"]
+
+    supabase.table("stock_items").update({
+        "current_quantity": new_qty,
+        "last_updated": datetime.now().isoformat(),
+    }).eq("id", item["id"]).execute()
+
+    supabase.table("stock_movements").insert({
+        "business_id": business["id"],
+        "item_name": item_name,
+        "quantity_change": qty,
+        "new_quantity": new_qty,
+        "type": "delivery_received",
+        "recorded_at": datetime.now().isoformat(),
+    }).execute()
+
+    # Clear cooldown: received stock means this PO cycle is done.
+    supabase.table("pending_actions").update({"status": "delivered"}).eq(
+        "business_id", business["id"]
+    ).eq("action_type", "purchase_order").eq("item_name", item_name).in_(
+        "status", ["sent", "confirmed"]
+    ).execute()
+
+    sheet_ok, sheet_msg = _update_sheet_quantity(business, item_name, new_qty)
+    unit = item.get("unit") or unit_text or ""
+    base = f"✅ Received logged: {item_name} +{qty} {unit}\nNew quantity: {new_qty} {unit}\nOn Order cleared."
+    if sheet_ok:
+        return f"{base}\n📄 Google Sheet updated."
+    return f"{base}\n⚠️ {sheet_msg}"
 
 
 def handle_check_stock(business):
     items = supabase.table("stock_items").select("*").eq("business_id", business["id"]).execute()
     if not items.data:
         return "No stock items yet. Type *sync stock* to load from your Google Sheet."
-    low = [i for i in items.data if (i.get("current_quantity") or 0) <= (i.get("reorder_threshold") or 0)]
+    on_order_rows = (
+        supabase.table("pending_actions")
+        .select("item_name")
+        .eq("business_id", business["id"])
+        .eq("action_type", "purchase_order")
+        .in_("status", ["sent", "confirmed"])
+        .execute()
+    )
+    on_order = {r.get("item_name") for r in (on_order_rows.data or []) if r.get("item_name")}
+
+    low = [
+        i for i in items.data
+        if (i.get("current_quantity") or 0) <= (i.get("reorder_threshold") or 0)
+        and i.get("name") not in on_order
+    ]
     ok = [i for i in items.data if (i.get("current_quantity") or 0) > (i.get("reorder_threshold") or 0)]
     msg = f"📦 *Stock — {business['name']}*\n\n"
+    if on_order:
+        msg += "🟡 *On Order:*\n"
+        for item_name in sorted(on_order):
+            msg += f"• {item_name}\n"
+        msg += "\n"
     if low:
         msg += "🔴 *Needs Reordering:*\n"
         for i in low:
@@ -478,6 +686,8 @@ def webhook():
         reply = handle_order_command(business, incoming_msg[6:].strip())
     elif msg_lower in ["send order", "yes send", "send it"]:
         reply = handle_send_order(business)
+    elif msg_lower.startswith("received "):
+        reply = handle_received_stock(business, incoming_msg)
     elif any(x in msg_lower for x in ["check stock", "stock levels", "my stock", "show stock"]):
         reply = handle_check_stock(business)
     elif msg_lower == "sync stock":
@@ -521,7 +731,7 @@ def webhook():
     # Default: Claude chat
     if reply is None:
         system = f"""You are Wavy AI for {business['name']}.
-Commands: "check stock", "sync stock", "order [item]", "send order", "check reviews"
+Commands: "check stock", "sync stock", "order [item]", "send order", "received [item] [qty]", "check reviews"
 Be concise, under 150 words."""
         try:
             response = claude_client.messages.create(
