@@ -494,23 +494,57 @@ def _parse_received_message(incoming_msg):
     return None, None, None
 
 
+def _parse_used_message(incoming_msg):
+    """
+    Supports:
+    - used chicken 3kg
+    - used 3kg chicken
+    - used chicken 3 kg
+    - used 3 kg chicken
+    """
+    text = re.sub(r"\s+", " ", (incoming_msg or "").strip()).lower()
+    m1 = re.match(r"^used\s+(.+?)\s+(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$", text)
+    if m1:
+        return m1.group(1).strip(), float(m1.group(2)), m1.group(3).strip()
+    m2 = re.match(r"^used\s+(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s+(.+)$", text)
+    if m2:
+        return m2.group(3).strip(), float(m2.group(1)), m2.group(2).strip()
+    return None, None, None
+
+
+def _find_stock_item(business_id, item_text):
+    """Find item by fuzzy name; tolerate trailing time words like 'today'."""
+    candidates = [item_text]
+    lowered = (item_text or "").strip().lower()
+    for suffix in (" today", " now", " tonight", " this morning", " this evening"):
+        if lowered.endswith(suffix):
+            candidates.append(lowered[: -len(suffix)].strip())
+            break
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        items = (
+            supabase.table("stock_items")
+            .select("*")
+            .eq("business_id", business_id)
+            .ilike("name", f"%{candidate}%")
+            .limit(1)
+            .execute()
+        )
+        if items.data:
+            return items.data[0]
+    return None
+
+
 def handle_received_stock(business, incoming_msg):
     item_text, qty, unit_text = _parse_received_message(incoming_msg)
     if not item_text or not qty or qty <= 0:
         return "Use format: *received chicken 10kg* or *received 10kg chicken*."
 
-    items = (
-        supabase.table("stock_items")
-        .select("*")
-        .eq("business_id", business["id"])
-        .ilike("name", f"%{item_text}%")
-        .limit(1)
-        .execute()
-    )
-    if not items.data:
+    item = _find_stock_item(business["id"], item_text)
+    if not item:
         return f"I couldn't find '{item_text}' in your stock list."
-
-    item = items.data[0]
     old_qty = float(item.get("current_quantity") or 0)
     new_qty = old_qty + qty
     item_name = item["name"]
@@ -539,6 +573,45 @@ def handle_received_stock(business, incoming_msg):
     sheet_ok, sheet_msg = _update_sheet_quantity(business, item_name, new_qty)
     unit = item.get("unit") or unit_text or ""
     base = f"✅ Received logged: {item_name} +{qty} {unit}\nNew quantity: {new_qty} {unit}\nOn Order cleared."
+    if sheet_ok:
+        return f"{base}\n📄 Google Sheet updated."
+    return f"{base}\n⚠️ {sheet_msg}"
+
+
+def handle_used_stock(business, incoming_msg):
+    item_text, qty, unit_text = _parse_used_message(incoming_msg)
+    if not item_text or not qty or qty <= 0:
+        return "Use format: *used chicken 3kg* or *used 3kg chicken*."
+
+    item = _find_stock_item(business["id"], item_text)
+    if not item:
+        return f"I couldn't find '{item_text}' in your stock list."
+
+    old_qty = float(item.get("current_quantity") or 0)
+    if qty > old_qty:
+        unit = item.get("unit") or unit_text or ""
+        return f"You only have {old_qty} {unit} of {item['name']}. Please use a smaller amount."
+
+    new_qty = old_qty - qty
+    item_name = item["name"]
+
+    supabase.table("stock_items").update({
+        "current_quantity": new_qty,
+        "last_updated": datetime.now().isoformat(),
+    }).eq("id", item["id"]).execute()
+
+    supabase.table("stock_movements").insert({
+        "business_id": business["id"],
+        "item_name": item_name,
+        "quantity_change": -qty,
+        "new_quantity": new_qty,
+        "type": "usage",
+        "recorded_at": datetime.now().isoformat(),
+    }).execute()
+
+    sheet_ok, sheet_msg = _update_sheet_quantity(business, item_name, new_qty)
+    unit = item.get("unit") or unit_text or ""
+    base = f"✅ Usage logged: {item_name} -{qty} {unit}\nNew quantity: {new_qty} {unit}"
     if sheet_ok:
         return f"{base}\n📄 Google Sheet updated."
     return f"{base}\n⚠️ {sheet_msg}"
@@ -688,6 +761,8 @@ def webhook():
         reply = handle_send_order(business)
     elif msg_lower.startswith("received "):
         reply = handle_received_stock(business, incoming_msg)
+    elif msg_lower.startswith("used "):
+        reply = handle_used_stock(business, incoming_msg)
     elif any(x in msg_lower for x in ["check stock", "stock levels", "my stock", "show stock"]):
         reply = handle_check_stock(business)
     elif msg_lower == "sync stock":
@@ -731,7 +806,7 @@ def webhook():
     # Default: Claude chat
     if reply is None:
         system = f"""You are Wavy AI for {business['name']}.
-Commands: "check stock", "sync stock", "order [item]", "send order", "received [item] [qty]", "check reviews"
+Commands: "check stock", "sync stock", "order [item]", "send order", "received [item] [qty]", "used [item] [qty]", "check reviews"
 Be concise, under 150 words."""
         try:
             response = claude_client.messages.create(
