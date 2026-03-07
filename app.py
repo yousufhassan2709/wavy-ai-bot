@@ -70,6 +70,107 @@ def get_business(sender):
     return result.data[0] if result.data else None
 
 
+def _supplier_reply_intent(text):
+    """Classify supplier reply as confirmed/rejected/unknown."""
+    msg = (text or "").strip().lower()
+    if not msg:
+        return "unknown"
+
+    reject_phrases = [
+        "cannot", "can't", "cant", "unavailable", "out of stock", "not available",
+        "no stock", "no", "unable", "decline", "reject",
+    ]
+    if any(p in msg for p in reject_phrases):
+        return "rejected"
+
+    confirm_phrases = [
+        "confirm", "confirmed", "yes", "ok", "okay", "sure",
+        "available", "will deliver", "can deliver", "accepted", "done",
+    ]
+    if any(p in msg for p in confirm_phrases):
+        return "confirmed"
+    return "unknown"
+
+
+def handle_supplier_reply(sender, incoming_msg):
+    """
+    Parse replies from supplier numbers and update purchase order status.
+    Returns reply text for supplier if sender is recognized supplier; else None.
+    """
+    sender_norm = _normalize_whatsapp_number(sender)
+    if not sender_norm:
+        return None
+
+    try:
+        supplier_items = supabase.table("stock_items").select(
+            "business_id,name,supplier_name,supplier_whatsapp"
+        ).execute()
+    except Exception:
+        return None
+
+    matched = None
+    for row in (supplier_items.data or []):
+        row_norm = _normalize_whatsapp_number(row.get("supplier_whatsapp"))
+        if row_norm and row_norm == sender_norm:
+            matched = row
+            break
+
+    if not matched:
+        return None
+
+    business_id = matched["business_id"]
+    item_name = matched["name"]
+    supplier_name = matched.get("supplier_name") or "Supplier"
+
+    business_res = supabase.table("businesses").select("*").eq("id", business_id).limit(1).execute()
+    if not business_res.data:
+        return "Thanks, message received."
+    business = business_res.data[0]
+
+    po = (
+        supabase.table("pending_actions")
+        .select("*")
+        .eq("business_id", business_id)
+        .eq("action_type", "purchase_order")
+        .eq("item_name", item_name)
+        .in_("status", ["sent", "pending", "confirmed"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not po.data:
+        send_whatsapp(
+            business["owner_phone"],
+            f"📩 Supplier *{supplier_name}* sent a message for *{item_name}*:\n\"{incoming_msg}\"",
+        )
+        return "Thanks — message received and shared with owner."
+
+    action = po.data[0]
+    intent = _supplier_reply_intent(incoming_msg)
+
+    if intent == "confirmed":
+        supabase.table("pending_actions").update({"status": "confirmed"}).eq("id", action["id"]).execute()
+        send_whatsapp(
+            business["owner_phone"],
+            f"✅ Supplier *{supplier_name}* confirmed your order for *{item_name}*.\n\nReply *received {item_name} [qty]* when delivery arrives.",
+        )
+        return "✅ Thanks! Order marked as confirmed."
+
+    if intent == "rejected":
+        supabase.table("pending_actions").update({"status": "rejected"}).eq("id", action["id"]).execute()
+        send_whatsapp(
+            business["owner_phone"],
+            f"❌ Supplier *{supplier_name}* rejected/unavailable for *{item_name}*.\nMessage: \"{incoming_msg}\"",
+        )
+        return "Got it. I marked this order as rejected and notified the owner."
+
+    send_whatsapp(
+        business["owner_phone"],
+        f"📩 Supplier *{supplier_name}* replied for *{item_name}*:\n\"{incoming_msg}\"",
+    )
+    return "Thanks — message received and shared with owner."
+
+
 def get_google_creds():
     """Load Google service account from env JSON. Returns None if not set or google-auth not installed."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -747,6 +848,13 @@ def webhook():
     msg_lower = incoming_msg.lower()
     business = get_business(sender)
     resp = MessagingResponse()
+
+    # If sender is not an owner, check if this is a supplier reply.
+    if not business:
+        supplier_reply = handle_supplier_reply(sender, incoming_msg)
+        if supplier_reply:
+            resp.message(supplier_reply)
+            return str(resp)
 
     if not business:
         resp.message("Welcome to Wavy AI! You're not registered yet.")
